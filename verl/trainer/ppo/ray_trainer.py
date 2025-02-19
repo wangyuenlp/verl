@@ -18,12 +18,14 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import uuid
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
 from copy import deepcopy
+from tqdm import tqdm
 
 import numpy as np
 from codetiming import Timer
@@ -575,7 +577,7 @@ class RayPPOTrainer(object):
         sample_outputs = []
         sample_scores = []
 
-        for test_data in self.val_dataloader:
+        for test_data in tqdm(self.val_dataloader, desc="Validation"):
             test_batch = DataProto.from_single_dict(test_data)
 
             # we only do validation on rule-based rm
@@ -838,8 +840,13 @@ class RayPPOTrainer(object):
         # we start from step 1
         self.global_steps += 1
 
-        for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+        # recompute `start_epoch`
+        num_steps_per_epoch = len(self.train_dataloader)
+        start_epoch = (self.global_steps - 1) // num_steps_per_epoch
+
+        for epoch in range(start_epoch, self.config.trainer.total_epochs):
+            tqdm_initial = (self.global_steps - 1) % num_steps_per_epoch
+            for batch_dict in tqdm(self.train_dataloader, desc=f"Epoch {epoch + 1} / {self.config.trainer.total_epochs}", initial=tqdm_initial):
                 metrics = {}
                 timing_raw = {}
 
@@ -851,7 +858,11 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
+                        print("generate_sequences start")
+                        start_time = time.time()
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        end_time = time.time()
+                        print(f"generate_sequences end, time: {end_time - start_time} seconds")
 
                     if self.config.algorithm.adv_estimator == 'remax':
                         with _timer('gen_max', timing_raw):
@@ -885,19 +896,31 @@ class RayPPOTrainer(object):
 
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
+                        print("compute_log_prob start")
+                        start_time = time.time()
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        end_time = time.time()
+                        print(f"compute_log_prob end, time: {end_time - start_time} seconds")
                         batch = batch.union(old_log_prob)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
+                            print("compute_ref_log_prob start")
+                            start_time = time.time()
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            end_time = time.time()
+                            print(f"compute_ref_log_prob end, time: {end_time - start_time} seconds")
                             batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
                         with _timer('values', timing_raw):
+                            print("compute_values start")
+                            start_time = time.time()
                             values = self.critic_wg.compute_values(batch)
+                            end_time = time.time()
+                            print(f"compute_values end, time: {end_time - start_time} seconds")
                             batch = batch.union(values)
 
                     with _timer('adv', timing_raw):
@@ -910,39 +933,59 @@ class RayPPOTrainer(object):
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
+                        print("reward_fn start")
+                        start_time = time.time()
                         reward_tensor = self.reward_fn(batch)
+                        end_time = time.time()
+                        print(f"reward_fn end, time: {end_time - start_time} seconds")
                         batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                            print("apply_kl_penalty start")
+                            start_time = time.time()
                             batch, kl_metrics = apply_kl_penalty(batch,
                                                                  kl_ctrl=self.kl_ctrl,
                                                                  kl_penalty=self.config.algorithm.kl_penalty)
+                            end_time = time.time()
+                            print(f"apply_kl_penalty end, time: {end_time - start_time} seconds")
                             metrics.update(kl_metrics)
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
+                        print("compute_advantage start")
+                        start_time = time.time()
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        end_time = time.time()
+                        print(f"compute_advantage end, time: {end_time - start_time} seconds")
 
                     # update critic
                     if self.use_critic:
+                        print("update_critic start")
+                        start_time = time.time()
                         with _timer('update_critic', timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
+                        end_time = time.time()
+                        print(f"update_critic end, time: {end_time - start_time} seconds")
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        print("update_actor start")
+                        start_time = time.time()
                         # update actor
                         with _timer('update_actor', timing_raw):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+                        end_time = time.time()
+                        print(f"update_actor end, time: {end_time - start_time} seconds")
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
@@ -963,8 +1006,6 @@ class RayPPOTrainer(object):
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
-                self.global_steps += 1
-
                 if self.global_steps >= self.total_training_steps:
 
                     # perform validation after training
@@ -977,3 +1018,5 @@ class RayPPOTrainer(object):
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
                     return
+
+                self.global_steps += 1
